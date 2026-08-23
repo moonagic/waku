@@ -60,10 +60,27 @@ if [ "$profile" = "debug" ] && [ "$codesign_identity_from_environment" = "0" ] &
 fi
 debug_adhoc_requirement="=designated => identifier \"$bundle_identifier\""
 if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
-  if [ "$profile" = "release" ]; then
-    cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
+  if [ "${WAKU_UNIVERSAL:-0}" = "1" ]; then
+    if [ "$profile" = "release" ]; then
+      cargo build --release --target aarch64-apple-darwin --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
+      cargo build --release --target x86_64-apple-darwin --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
+      mkdir -p "$cargo_target_dir/$profile"
+      lipo -create "$cargo_target_dir/aarch64-apple-darwin/$profile/waku" "$cargo_target_dir/x86_64-apple-darwin/$profile/waku" -output "$cargo_target_dir/$profile/waku"
+      lipo -create "$cargo_target_dir/aarch64-apple-darwin/$profile/waku_js_repl" "$cargo_target_dir/x86_64-apple-darwin/$profile/waku_js_repl" -output "$cargo_target_dir/$profile/waku_js_repl"
+      lipo -create "$cargo_target_dir/aarch64-apple-darwin/$profile/waku-daemon" "$cargo_target_dir/x86_64-apple-darwin/$profile/waku-daemon" -output "$cargo_target_dir/$profile/waku-daemon"
+    else
+      cargo build --target aarch64-apple-darwin --package waku --bin waku --bin waku_js_repl
+      cargo build --target x86_64-apple-darwin --package waku --bin waku --bin waku_js_repl
+      mkdir -p "$cargo_target_dir/$profile"
+      lipo -create "$cargo_target_dir/aarch64-apple-darwin/$profile/waku" "$cargo_target_dir/x86_64-apple-darwin/$profile/waku" -output "$cargo_target_dir/$profile/waku"
+      lipo -create "$cargo_target_dir/aarch64-apple-darwin/$profile/waku_js_repl" "$cargo_target_dir/x86_64-apple-darwin/$profile/waku_js_repl" -output "$cargo_target_dir/$profile/waku_js_repl"
+    fi
   else
-    cargo build --package waku --bin waku --bin waku_js_repl
+    if [ "$profile" = "release" ]; then
+      cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
+    else
+      cargo build --package waku --bin waku --bin waku_js_repl
+    fi
   fi
 fi
 
@@ -76,13 +93,17 @@ swift_module_cache="$cargo_target_dir/$profile/swift-module-cache"
 helper_source="resources/computer-use/WakuComputerUse.swift"
 menu_bar_cursor_resource="resources/computer-use/menubar-cursor.png"
 overlay_cursor_resource="resources/computer-use/overlay-cursor.svg"
+target_arch_spec="$(uname -m)"
+if [ "${WAKU_UNIVERSAL:-0}" = "1" ]; then
+  target_arch_spec="universal"
+fi
 helper_fingerprint="$({
   shasum -a 256 \
     "$helper_source" \
     resources/computer-use/Info.plist \
     "$menu_bar_cursor_resource" \
     "$overlay_cursor_resource"
-  printf '%s\n' "standalone-service-v2" "$helper_name" "$bundle_identifier.computer-use" "$codesign_identity" "$(uname -m)-apple-macos13.0"
+  printf '%s\n' "standalone-service-v2" "$helper_name" "$bundle_identifier.computer-use" "$codesign_identity" "${target_arch_spec}-apple-macos13.0"
   xcrun swiftc -version
 } | shasum -a 256 | awk '{ print $1 }')"
 helper_cache_root=".waku-cache/computer-use/$profile"
@@ -109,13 +130,33 @@ if [ ! -d "$cached_helper_bundle" ]; then
   plutil -replace CFBundleExecutable -string "$helper_name" "$cached_helper_contents/Info.plist"
   plutil -replace CFBundleIdentifier -string "$bundle_identifier.computer-use" "$cached_helper_contents/Info.plist"
   plutil -replace CFBundleName -string "$helper_name" "$cached_helper_contents/Info.plist"
-  xcrun swiftc \
-    -O \
-    -parse-as-library \
-    -module-cache-path "$swift_module_cache" \
-    -target "$(uname -m)-apple-macos13.0" \
-    "$helper_source" \
-    -o "$cached_helper_contents/MacOS/$helper_name"
+  if [ "${WAKU_UNIVERSAL:-0}" = "1" ]; then
+    xcrun swiftc \
+      -O \
+      -parse-as-library \
+      -module-cache-path "$swift_module_cache" \
+      -target "arm64-apple-macos13.0" \
+      "$helper_source" \
+      -o "$cached_helper_contents/MacOS/$helper_name-arm64"
+    xcrun swiftc \
+      -O \
+      -parse-as-library \
+      -module-cache-path "$swift_module_cache" \
+      -target "x86_64-apple-macos13.0" \
+      "$helper_source" \
+      -o "$cached_helper_contents/MacOS/$helper_name-x86_64"
+    lipo -create "$cached_helper_contents/MacOS/$helper_name-arm64" "$cached_helper_contents/MacOS/$helper_name-x86_64" \
+      -output "$cached_helper_contents/MacOS/$helper_name"
+    rm -f "$cached_helper_contents/MacOS/$helper_name-arm64" "$cached_helper_contents/MacOS/$helper_name-x86_64"
+  else
+    xcrun swiftc \
+      -O \
+      -parse-as-library \
+      -module-cache-path "$swift_module_cache" \
+      -target "$(uname -m)-apple-macos13.0" \
+      "$helper_source" \
+      -o "$cached_helper_contents/MacOS/$helper_name"
+  fi
   if [ "$codesign_identity" = "-" ]; then
     codesign --force --sign - "$cached_helper_staging"
   elif [ "$profile" = "release" ]; then

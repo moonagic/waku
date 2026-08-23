@@ -46,6 +46,7 @@ Options:
                                 default derives a monotonic number from the
                                 Cargo version)
   --volume-name <name>          Mounted DMG name (default: Waku)
+  --universal                   Build universal binary (arm64 + x86_64)
   --skip-build                  Reuse target/release/waku, waku_js_repl, and
                                 waku-daemon
   --skip-notarize               Unnotarized signed DMG (implies --local)
@@ -84,6 +85,7 @@ const { values } = parseArgs({
     "signing-identity": { type: "string" },
     "skip-build": { type: "boolean" },
     "skip-notarize": { type: "boolean" },
+    universal: { type: "boolean" },
     "volume-name": { type: "string" },
   },
   strict: true,
@@ -144,6 +146,8 @@ const notaryProfile =
   defaultNotaryProfile;
 const explicitBuildNumber =
   values["build-number"] ?? process.env.WAKU_BUILD_NUMBER;
+const universal =
+  values.universal ?? (process.env.WAKU_UNIVERSAL === "1");
 const analyticsEndpoint = process.env.WAKU_ANALYTICS_ENDPOINT?.trim();
 const analyticsWebsiteId = process.env.WAKU_ANALYTICS_WEBSITE_ID?.trim();
 const localOnly = values.local ?? false;
@@ -409,9 +413,9 @@ try {
   logStep(
     values["skip-build"]
       ? "Assembling the app bundle"
-      : "Building and assembling the app bundle",
+      : `Building and assembling the app bundle${universal ? " (universal: arm64 + x86_64)" : ""}`,
   );
-  await $`env WAKU_CODESIGN_IDENTITY=${identity} WAKU_ANALYTICS_ENDPOINT=${analyticsEndpoint ?? ""} WAKU_ANALYTICS_WEBSITE_ID=${analyticsWebsiteId ?? ""} WAKU_SKIP_CARGO_BUILD=${values["skip-build"] ? "1" : "0"} ${join(projectRoot, "scripts", "bundle.sh")} release`;
+  await $`env WAKU_CODESIGN_IDENTITY=${identity} WAKU_ANALYTICS_ENDPOINT=${analyticsEndpoint ?? ""} WAKU_ANALYTICS_WEBSITE_ID=${analyticsWebsiteId ?? ""} WAKU_SKIP_CARGO_BUILD=${values["skip-build"] ? "1" : "0"} WAKU_UNIVERSAL=${universal ? "1" : "0"} ${join(projectRoot, "scripts", "bundle.sh")} release`;
   for (const artifact of [
     join(contentsDirectory, "MacOS", executableName),
     bundledDaemonExecutable,

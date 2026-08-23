@@ -290,6 +290,7 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: oven-sh/setup-bun@v2
 
@@ -335,11 +336,12 @@ jobs:
 
       - name: Release
         env:
+          WAKU_UNIVERSAL: "1"
           WAKU_SIGNING_IDENTITY: ${{ secrets.WAKU_SIGNING_IDENTITY }}
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: bun run release --local
+        run: bun run release --local --universal
 
       - uses: actions/upload-artifact@v7
         with:
