@@ -147,7 +147,7 @@ fn session_group_header(theme: &Theme) -> Div {
         .items_center()
         .text_size(sp(13.0))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(theme.text_tertiary)
+        .text_color(theme.text_secondary)
 }
 
 fn append_sidebar_group_rows(
@@ -210,6 +210,8 @@ const SIDEBAR_SESSION_ROW_GAP: f32 = 1.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = SIDEBAR_SESSION_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ACTION_ROW_HEIGHT: f32 = 32.0;
 const SIDEBAR_SEARCH_BOTTOM_GAP: f32 = 10.0;
+const SIDEBAR_GROUP_GUIDE_X: f32 = 15.0;
+const SIDEBAR_GROUP_CHILD_PADDING: f32 = 28.0;
 const SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
 const SIDEBAR_PROJECT_REVEAL_BATCH: usize = 30;
 
@@ -545,7 +547,7 @@ impl Waku {
                 .hover(|element| element.bg(theme.overlay))
                 .active(|element| element.bg(theme.overlay_strong))
                 .tooltip(Tooltip::text(tr!("sidebar.options")))
-                .child(icon("icons/list-filter.svg", 14.0, theme.text_ghost)),
+                .child(icon("icons/list-filter.svg", 14.0, theme.text_secondary)),
             "sidebar-options-menu",
             &menu,
             MenuAlign::BelowLeft,
@@ -614,8 +616,12 @@ impl Waku {
             .hover(|element| element.bg(theme.overlay))
             .active(|element| element.bg(theme.overlay_strong))
             .tooltip(Tooltip::text(tr!("project.new_project")))
-            .child(icon("icons/folder-new.svg", 15.0, theme.text_ghost))
-            .on_click(cx.listener(|this, _, _, cx| this.add_project(cx)))
+            .child(icon("icons/folder-new.svg", 14.0, theme.text_secondary))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.add_project(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     this.add_project(cx);
@@ -661,7 +667,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon(icon_path, 16.0, theme.text_secondary)),
+                    .child(icon(icon_path, 14.0, theme.text_secondary)),
             )
             .child(
                 div()
@@ -1262,9 +1268,13 @@ impl Waku {
         };
         match *row {
             SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
-            SidebarRow::Header(group) => self
-                .render_sidebar_group_header(group, index == 1, cx)
-                .into_any_element(),
+            SidebarRow::Header(group) => {
+                let has_expanded_children = rows.get(index + 1).is_some_and(|row| {
+                    matches!(row, SidebarRow::Session(_) | SidebarRow::ShowMore(_))
+                });
+                self.render_sidebar_group_header(group, index == 1, has_expanded_children, cx)
+                    .into_any_element()
+            }
             SidebarRow::Session(session_id) => self
                 .render_sidebar_session_item(session_id, cx)
                 .into_any_element(),
@@ -1279,14 +1289,26 @@ impl Waku {
         &self,
         group: SidebarGroup,
         first: bool,
+        has_expanded_children: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
         let collapsed = self.sidebar_collapsed_groups.contains(&group);
         let group_key = group.element_key();
         let group_name = SharedString::from(format!("sidebar-group-header-{group_key}"));
+        let header_focus = self
+            .sidebar_group_header_focuses
+            .borrow_mut()
+            .entry(group)
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
         let show_folder_icon =
             matches!(group, SidebarGroup::Project(_) | SidebarGroup::Projectless);
+        let folder_icon = if collapsed {
+            "icons/folder.svg"
+        } else {
+            "icons/folder-open.svg"
+        };
         let label = match group {
             SidebarGroup::Updated(group) => group.label(),
             SidebarGroup::Project(project_id) => self
@@ -1298,67 +1320,172 @@ impl Waku {
                 .unwrap_or_else(|| tr!("project.no_project_name")),
             SidebarGroup::Projectless => tr!("project.no_project_name"),
         };
-        let chevron = icon("icons/chevron-down.svg", 11.0, theme.text_ghost)
-            .when(collapsed, |icon| {
-                icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
-            })
-            .invisible()
-            .group_hover(group_name.clone(), |icon| icon.visible());
+        let updated_chevron = matches!(group, SidebarGroup::Updated(_)).then(|| {
+            icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
+                .when(collapsed, |icon| {
+                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
+                })
+                .invisible()
+                .group_hover(group_name.clone(), |icon| icon.visible())
+        });
+        let compose = show_folder_icon.then(|| {
+            let compose_focus = self
+                .sidebar_group_compose_focuses
+                .borrow_mut()
+                .entry(group)
+                .or_insert_with(|| cx.focus_handle())
+                .clone();
+            div()
+                .w(px(20.0))
+                .h(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "sidebar-group-compose-{group_key}"
+                        )))
+                        .track_focus(&compose_focus)
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .w_0()
+                        .h(px(22.0))
+                        .overflow_hidden()
+                        .rounded(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_default()
+                        .opacity(0.0)
+                        .group_hover(group_name.clone(), |style| style.w(px(20.0)).opacity(1.0))
+                        .focus_visible(|style| {
+                            style
+                                .w(px(20.0))
+                                .opacity(1.0)
+                                .border_1()
+                                .border_color(theme.accent)
+                        })
+                        .hover(|style| style.bg(theme.overlay))
+                        .active(|style| style.bg(theme.overlay_strong))
+                        .tooltip(Tooltip::text(tr!("menu.new_task")))
+                        .child(icon("icons/compose.svg", 14.0, theme.text_secondary))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_new_task_for_sidebar_group(group, window, cx);
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.open_new_task_for_sidebar_group(group, window, cx);
+                                cx.stop_propagation();
+                            }
+                        })),
+                )
+        });
 
-        session_group_header(&theme)
+        let header = session_group_header(&theme)
+            .id(SharedString::from(format!(
+                "sidebar-group-toggle-{group_key}"
+            )))
+            .track_focus(&header_focus)
+            .tab_index(0)
+            .tab_group()
+            .tab_stop(true)
             .group(group_name)
+            .relative()
             .w_full()
+            .rounded(px(6.0))
+            .cursor_default()
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .hover(|style| style.bg(theme.sidebar_item_background))
+            .active(|style| style.bg(theme.overlay_strong))
             .child(
                 div()
-                    .id(SharedString::from(format!(
-                        "sidebar-group-toggle-{group_key}"
-                    )))
-                    .tab_index(0)
+                    .flex_1()
+                    .min_w_0()
                     .h(px(22.0))
-                    .rounded(px(4.0))
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .cursor_default()
-                    .focus_visible(|style| style.border_1().border_color(theme.accent))
                     .when(show_folder_icon, |element| {
-                        element.child(icon("icons/folder.svg", 12.0, theme.text_ghost))
+                        element.child(icon(folder_icon, 14.0, theme.text_secondary))
                     })
-                    .child(label)
-                    .child(chevron)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_sidebar_group(group, cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        match event.keystroke.key.as_str() {
-                            "enter" | "space" => {
-                                this.toggle_sidebar_group(group, cx);
-                                cx.stop_propagation();
-                            }
-                            "left" if !collapsed => {
-                                this.set_sidebar_group_collapsed(group, true, cx);
-                                cx.stop_propagation();
-                            }
-                            "right" if collapsed => {
-                                this.set_sidebar_group_collapsed(group, false, cx);
-                                cx.stop_propagation();
-                            }
-                            _ => {}
-                        }
-                    })),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(div().min_w_0().truncate().child(label))
+                            .when_some(updated_chevron, |element, chevron| element.child(chevron)),
+                    )
+                    .child(div().flex_1()),
             )
+            .when_some(compose, |element, compose| element.child(compose))
             .when(first, |element| {
-                element
-                    .justify_between()
-                    .child(self.render_sidebar_header_actions(cx))
+                element.child(self.render_sidebar_header_actions(cx))
             })
+            .when(
+                show_folder_icon && has_expanded_children,
+                |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .left(px(SIDEBAR_GROUP_GUIDE_X))
+                            .top(px(19.0))
+                            .bottom(px(-2.0))
+                            .w(px(1.0))
+                            .bg(theme.border),
+                    )
+                },
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_sidebar_group(group, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    "enter" | "space" => {
+                        this.toggle_sidebar_group(group, cx);
+                        cx.stop_propagation();
+                    }
+                    "left" if !collapsed => {
+                        this.set_sidebar_group_collapsed(group, true, cx);
+                        cx.stop_propagation();
+                    }
+                    "right" if collapsed => {
+                        this.set_sidebar_group_collapsed(group, false, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }));
+
+        div().w_full().pb(px(2.0)).child(header)
+    }
+
+    fn open_new_task_for_sidebar_group(
+        &mut self,
+        group: SidebarGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_page = None;
+        match group {
+            SidebarGroup::Project(project_id) => self.select_project(project_id, cx),
+            SidebarGroup::Projectless => self.create_projectless_session(cx),
+            SidebarGroup::Updated(_) => return,
+        }
+        let focus = self.composer_focus(cx);
+        window.focus(&focus, cx);
     }
 
     fn render_sidebar_show_more(
         &self,
         group: SidebarGroup,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let theme = Theme::current(cx);
         let group_key = group.element_key();
         let focus = self
@@ -1367,24 +1494,17 @@ impl Waku {
             .entry(group)
             .or_insert_with(|| cx.focus_handle())
             .clone();
-        div()
+        let button = div()
             .id(SharedString::from(format!("sidebar-show-more-{group_key}")))
             .track_focus(&focus)
             .tab_index(0)
             .tab_stop(true)
-            .w_full()
-            .h(px(30.0))
             .flex_none()
-            .px(px(8.0))
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
             .cursor_default()
             .text_size(sp(12.5))
             .text_color(theme.text_tertiary)
-            .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .hover(|element| element.bg(theme.sidebar_item_background))
-            .active(|element| element.bg(theme.overlay_strong))
+            .focus_visible(|style| style.text_color(theme.text))
+            .hover(|style| style.text_color(theme.text))
             .child(tr!("sidebar.show_more"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.show_more_project_sessions(group, cx);
@@ -1394,7 +1514,30 @@ impl Waku {
                     this.show_more_project_sessions(group, cx);
                     cx.stop_propagation();
                 }
-            }))
+            }));
+
+        div()
+            .relative()
+            .w_full()
+            .h(px(30.0))
+            .pl(px(SIDEBAR_GROUP_CHILD_PADDING))
+            .flex()
+            .items_center()
+            .child(button)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(SIDEBAR_GROUP_GUIDE_X))
+                    .top_0()
+                    .w(px(
+                        SIDEBAR_GROUP_CHILD_PADDING - SIDEBAR_GROUP_GUIDE_X - 4.0,
+                    ))
+                    .h(px(15.0))
+                    .border_l_1()
+                    .border_b_1()
+                    .rounded_bl(px(4.0))
+                    .border_color(theme.border),
+            )
     }
 
     fn show_more_project_sessions(&mut self, group: SidebarGroup, cx: &mut Context<Self>) {
@@ -1407,6 +1550,26 @@ impl Waku {
     fn toggle_sidebar_group(&mut self, group: SidebarGroup, cx: &mut Context<Self>) {
         let collapsed = !self.sidebar_collapsed_groups.contains(&group);
         self.set_sidebar_group_collapsed(group, collapsed, cx);
+    }
+
+    pub(super) fn collapse_all_sidebar_groups(&mut self, cx: &mut Context<Self>) {
+        let groups = self
+            .sidebar_rows_cached(Local::now().date_naive(), unix_time())
+            .iter()
+            .filter_map(|row| match row {
+                SidebarRow::Header(group) => Some(*group),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for group in groups {
+            changed |= self.sidebar_collapsed_groups.insert(group);
+            changed |= self.sidebar_project_reveal_counts.remove(&group).is_some();
+        }
+        if changed {
+            self.sidebar_rows_fingerprint.set(None);
+            cx.notify();
+        }
     }
 
     fn set_sidebar_group_collapsed(
@@ -1551,6 +1714,11 @@ impl Waku {
             .iter()
             .find(|project| project.id == session.project_id);
         let grouped_by_project = self.state.sidebar_grouping == SidebarGrouping::Project;
+        let left_padding = if grouped_by_project {
+            SIDEBAR_GROUP_CHILD_PADDING
+        } else {
+            8.0
+        };
         let detail_label = if grouped_by_project {
             persisted_sidebar_branch_label(&session.workspace)
                 .map(|branch| SharedString::from(branch.to_owned()))
@@ -1627,7 +1795,8 @@ impl Waku {
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .px(px(8.0))
+            .pl(px(left_padding))
+            .pr(px(8.0))
             .py(px(7.0))
             .rounded(px(7.0))
             .cursor_default()
@@ -1671,7 +1840,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .text_size(sp(13.0))
+                    .text_size(sp(if grouped_by_project { 12.5 } else { 13.0 }))
                     .line_height(sp(15.0))
                     .when_some(detail_label, |element, label| {
                         element
@@ -1757,9 +1926,21 @@ impl Waku {
         };
 
         div()
+            .relative()
             .w_full()
             .pb(px(SIDEBAR_SESSION_ROW_GAP))
             .child(row)
+            .when(grouped_by_project, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .left(px(SIDEBAR_GROUP_GUIDE_X))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(1.0))
+                        .bg(theme.border),
+                )
+            })
             .into_any_element()
     }
 

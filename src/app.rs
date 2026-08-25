@@ -66,11 +66,12 @@ use crate::ui::{
     icon_button, motion, provider_color, provider_icon, status_color, toggle_switch,
 };
 use crate::{
-    CancelTurn, CloseFind, CloseWindow, CopySelection, FindNext, FindPrevious, FocusComposer,
-    NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace, OpenSettings,
-    ReplaceAllMatches, SaveFile, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
-    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
-    ToggleUsagePanel,
+    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
+    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
+    OpenFind, OpenFindReplace, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask,
+    SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -559,7 +560,7 @@ struct DriverStartRequest {
     provider: ProviderKind,
     options: DriverStartOptions,
     event_wake: smol::channel::Sender<()>,
-    daemon_client: waku_client::DaemonClient,
+    daemon: waku_client::DaemonSupervisor,
 }
 
 /// A provider process that has started off-thread but is not installed into
@@ -936,8 +937,8 @@ struct ComputerUsePreview {
 struct SessionNavigation {
     back: Vec<Uuid>,
     forward: Vec<Uuid>,
-    /// The unstarted task behind the global New Task entry. Viewing another
-    /// session must not make that entry forget the project chosen for it.
+    /// The most recently selected unstarted task. The global New Task entry
+    /// may reuse it only when it belongs to the currently selected project.
     new_task: Option<Uuid>,
 }
 
@@ -981,11 +982,17 @@ impl SessionNavigation {
         self.new_task = Some(session_id);
     }
 
-    fn remembered_new_task(&self, sessions: &[AgentSession]) -> Option<Uuid> {
+    fn remembered_new_task(
+        &self,
+        sessions: &[AgentSession],
+        current_project_id: Uuid,
+    ) -> Option<Uuid> {
         self.new_task.filter(|session_id| {
-            sessions
-                .iter()
-                .any(|session| session.id == *session_id && !session.has_started())
+            sessions.iter().any(|session| {
+                session.id == *session_id
+                    && session.project_id == current_project_id
+                    && !session.has_started()
+            })
         })
     }
 }
@@ -1052,6 +1059,7 @@ pub struct Waku {
     composer_draft_store: ComposerDraftStore,
     composer_draft_save_generation: u64,
     command_palette: command_palette::CommandPaletteUi,
+    task_switcher: task_switcher::TaskSwitcherUi,
     model_search: Entity<TextInput>,
     settings_search: Entity<TextInput>,
     daemon_port_input: Entity<TextInput>,
@@ -1203,22 +1211,38 @@ pub struct Waku {
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
     commit_dialog: Option<commit_dialog::CommitDialogState>,
+    goal_dialog: Option<goal_dialog::GoalDialogState>,
+    goal_dialog_request: Option<goal_dialog::GoalDialogRequest>,
+    /// Goal operations accepted before the session's runtime exists. Goals
+    /// attach to the provider thread, not to any turn, so `/goal` on a fresh
+    /// task starts the provider and these drain once it installs.
+    pending_goal_operations: HashMap<Uuid, Vec<crate::model::GoalOperation>>,
+    /// Sessions whose runtime is being started by a goal operation rather
+    /// than a submission. Submissions queue behind this instead of racing a
+    /// second provider process into existence.
+    goal_runtime_starts: HashSet<Uuid>,
+    /// When each session's goal accounting was last reported. The chip adds
+    /// the wall clock since then while an active goal's turn runs, so elapsed
+    /// pursuit time ticks live the way the Codex CLI shows it.
+    goal_observed_at: HashMap<Uuid, Instant>,
     /// Commit-message generation and Git mutation outlive the modal that
     /// started them. Keeping the operation on the app also lets every
     /// Environment surface reflect and gate the same in-flight action.
     commit_operation: Option<commit_dialog::CommitOperationState>,
-    /// Slash commands discovered per (provider, project root). Filesystem
-    /// walks live on the background executor; frames read the index below.
-    slash_commands: QueryCache<(ProviderKind, PathBuf), Vec<SlashCommand>>,
+    /// Slash commands discovered per (provider, project root, CLI override).
+    /// Filesystem and CLI probes live off the UI thread; frames read this cache.
+    slash_commands: QueryCache<(ProviderKind, PathBuf, Option<String>), Vec<SlashCommand>>,
     /// The merged command list the autocomplete popup draws, and the key it
     /// was built for — a stale key means "no commands", never another
     /// provider's list.
     slash_command_index: Rc<Vec<SlashCommand>>,
-    slash_command_index_key: Option<(ProviderKind, PathBuf)>,
+    slash_command_index_key: Option<(ProviderKind, PathBuf, Option<String>)>,
+    slash_command_index_loading: bool,
     /// Workspace file index per project root, for `@` mentions.
     mention_files: QueryCache<PathBuf, Vec<FileEntry>>,
     mention_file_index: Rc<Vec<FileEntry>>,
     mention_file_index_path: Option<PathBuf>,
+    mention_file_index_loading: bool,
     /// Set when a driver reports its command registry mid-drain; the drain
     /// has no `Context` to rebuild the drawn index itself.
     composer_sources_stale: bool,
@@ -1295,6 +1319,10 @@ pub struct Waku {
     /// Number of older sessions revealed inside each project section. This is
     /// runtime-only so every launch starts with the recent three-day view.
     sidebar_project_reveal_counts: HashMap<SidebarGroup, usize>,
+    /// Stable keyboard focus for each virtualized sidebar group header and
+    /// its hover-revealed New Task control.
+    sidebar_group_header_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
+    sidebar_group_compose_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     /// Stable keyboard focus for each virtualized project-history reveal row.
     sidebar_show_more_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     sidebar_visible: bool,
@@ -1531,6 +1559,13 @@ pub struct Waku {
     markdown_link_handler: md::render::LinkHandler,
     /// Transcript-wide text selection, spanning messages and tool output.
     transcript_selection: TranscriptSelection,
+    /// Programmatic focus for the transcript canvas. Clicking the transcript
+    /// moves focus here so the shared find action can distinguish it from the
+    /// right-panel file editor without putting the canvas in the tab order.
+    transcript_focus: FocusHandle,
+    /// Find-in-page state for the selected transcript, created lazily on the
+    /// first primary-modifier F press.
+    transcript_search: Option<transcript_search::TranscriptSearch>,
     /// Independent selection for the transient toast message. Keeping it out
     /// of the transcript registry prevents an overlay from joining a drag to
     /// whatever happens to be painted beneath it.
@@ -1562,6 +1597,7 @@ mod background_work;
 mod branches;
 mod command_palette;
 mod commit_dialog;
+mod goal_dialog;
 mod components;
 mod composer;
 mod drafts;
@@ -1575,7 +1611,9 @@ mod settings;
 mod sidebar;
 mod skills_page;
 mod streaming;
+mod task_switcher;
 mod transcript;
+mod transcript_search;
 mod transcript_view;
 mod usage_meter;
 mod usage_page;
@@ -1587,6 +1625,7 @@ use background_work::{
 };
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
+pub use goal_dialog::init as init_goal_dialog_keys;
 use components::*;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
@@ -2232,6 +2271,19 @@ impl Waku {
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
+            let task_switcher_focus = cx.focus_handle();
+            cx.on_focus_out(
+                &task_switcher_focus,
+                window,
+                |this: &mut Self, _, window, cx| {
+                    this.cancel_task_switcher(window, cx);
+                },
+            )
+            .detach();
+            let mut task_switcher = task_switcher::TaskSwitcherUi::new(task_switcher_focus);
+            if let Some(selected_session) = state.selected_session {
+                task_switcher.record_access(selected_session);
+            }
 
             cx.on_focus(&updater_button_focus, window, |this: &mut Self, _, cx| {
                 this.set_updater_button_focused(true, cx);
@@ -2655,6 +2707,7 @@ impl Waku {
                 composer_draft_store,
                 composer_draft_save_generation: 0,
                 command_palette: command_palette::CommandPaletteUi::new(command_palette_search),
+                task_switcher,
                 model_search,
                 branch_search,
                 branch_create_input,
@@ -2739,15 +2792,22 @@ impl Waku {
                 visible_branch_snapshot: None,
                 branch_operation_pending: false,
                 commit_dialog: None,
+                goal_dialog: None,
+                goal_dialog_request: None,
+                pending_goal_operations: HashMap::new(),
+                goal_runtime_starts: HashSet::new(),
+                goal_observed_at: HashMap::new(),
                 commit_operation: None,
                 // Providers × workspaces; both scans are small, the cache
                 // only exists to keep them off the frame path.
                 slash_commands: QueryCache::new(2 * MAX_CACHED_WORKSPACES),
                 slash_command_index: Rc::new(Vec::new()),
                 slash_command_index_key: None,
+                slash_command_index_loading: false,
                 mention_files: QueryCache::new(MAX_CACHED_WORKSPACES),
                 mention_file_index: Rc::new(Vec::new()),
                 mention_file_index_path: None,
+                mention_file_index_loading: false,
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
@@ -2778,6 +2838,8 @@ impl Waku {
                 session_rename_input,
                 sidebar_collapsed_groups: HashSet::new(),
                 sidebar_project_reveal_counts: HashMap::new(),
+                sidebar_group_header_focuses: RefCell::new(HashMap::new()),
+                sidebar_group_compose_focuses: RefCell::new(HashMap::new()),
                 sidebar_show_more_focuses: RefCell::new(HashMap::new()),
                 sidebar_visible,
                 sidebar_width,
@@ -2909,6 +2971,8 @@ impl Waku {
                 activity_diff_viewports: RefCell::new(HashMap::new()),
                 markdown_link_handler,
                 transcript_selection: TranscriptSelection::default(),
+                transcript_focus: cx.focus_handle(),
+                transcript_search: None,
                 toast_selection: TranscriptSelection::default(),
                 transcript_scrollbar: ScrollbarState::new(),
                 menus: RefCell::new(HashMap::new()),
